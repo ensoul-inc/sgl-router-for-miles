@@ -35,6 +35,7 @@ fn default_generate_request() -> GenerateRequest {
         text: None,
         model: None,
         input_ids: None,
+        exact_prefix: None,
         input_embeds: None,
         image_data: None,
         video_data: None,

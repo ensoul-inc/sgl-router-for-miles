@@ -603,6 +603,7 @@ async fn test_unsupported_endpoints() {
         text: Some("Hello world".to_string()),
         model: None,
         input_ids: None,
+        exact_prefix: None,
         input_embeds: None,
         image_data: None,
         video_data: None,
