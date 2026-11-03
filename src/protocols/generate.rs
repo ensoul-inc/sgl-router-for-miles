@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
@@ -14,6 +14,26 @@ use crate::protocols::validated::Normalizable;
 // SGLang Generate API (native format)
 // ============================================================================
 
+/// Prepared token history; all engine-owned metadata is forwarded unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExactPrefix {
+    #[serde(deserialize_with = "deserialize_exact_prefix_ids")]
+    pub ids: Vec<u32>,
+    #[serde(flatten)]
+    pub metadata: serde_json::Map<String, Value>,
+}
+
+fn deserialize_exact_prefix_ids<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ids = Vec::<u32>::deserialize(deserializer)?;
+    if ids.is_empty() {
+        return Err(D::Error::custom("exact_prefix.ids must not be empty"));
+    }
+    Ok(ids)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Validate)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
@@ -26,6 +46,10 @@ pub struct GenerateRequest {
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
+
+    /// Exact canonical history accompanying a media-layout text prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_prefix: Option<ExactPrefix>,
 
     /// Input embeddings for direct embedding input
     /// Can be a 2D array (single request) or 3D array (batch of requests)
@@ -251,6 +275,17 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        // The text is only a media layout when an exact prefix is supplied.
+        // Match cache prefixes using the history the engine actually consumes.
+        if let Some(ref prefix) = self.exact_prefix {
+            return prefix
+                .ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+
         // Check fields in priority order: text, input_ids
         if let Some(ref text) = self.text {
             return text.clone();
@@ -273,6 +308,111 @@ impl GenerationRequest for GenerateRequest {
 
         // No text input found
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod exact_prefix_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn payload() -> Value {
+        json!({
+            "text": "<|vision_start|><|video_pad|><|vision_end|>boundary-A",
+            "exact_prefix": {
+                "ids": [248045, 71, 68, 75, 75, 78, 248053, 248057, 248054],
+                "structure_ids": [248045, 71, 68, 75, 75, 78, 248053, 248057, 248054],
+                "literal_media_tokens": [],
+                "boundary": "boundary-A",
+                "future_engine_metadata": {"keep": [true, 3, "unchanged"]}
+            },
+            "video_data": ["data:video/mp4;base64,AA=="],
+            "sampling_params": {"max_new_tokens": 1, "n": 1},
+            "return_prompt_token_ids": true,
+            "return_logprob": true,
+            "return_routed_experts": true,
+            "routed_experts_start_len": 9
+        })
+    }
+
+    #[test]
+    fn prepared_prefix_and_existing_generate_fields_survive_round_trip() {
+        let sent = payload();
+        let request: GenerateRequest = serde_json::from_value(sent.clone()).unwrap();
+        let forwarded = serde_json::to_value(request).unwrap();
+        for field in [
+            "text",
+            "exact_prefix",
+            "video_data",
+            "return_prompt_token_ids",
+            "return_logprob",
+            "return_routed_experts",
+            "routed_experts_start_len",
+        ] {
+            assert_eq!(forwarded[field], sent[field], "changed {field}");
+        }
+    }
+
+    #[test]
+    fn routing_uses_exact_history_not_layout_or_boundary() {
+        let original = payload();
+        let request: GenerateRequest = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "248045 71 68 75 75 78 248053 248057 248054"
+        );
+        let mut another_boundary = original.clone();
+        another_boundary["text"] = json!("different media layout and boundary-B");
+        another_boundary["exact_prefix"]["boundary"] = json!("boundary-B");
+        let same_history: GenerateRequest = serde_json::from_value(another_boundary).unwrap();
+        assert_eq!(
+            request.extract_text_for_routing(),
+            same_history.extract_text_for_routing()
+        );
+
+        let mut other_history = original;
+        other_history["exact_prefix"]["ids"][1] = json!(72);
+        let different: GenerateRequest = serde_json::from_value(other_history).unwrap();
+        assert_ne!(
+            request.extract_text_for_routing(),
+            different.extract_text_for_routing()
+        );
+    }
+
+    #[test]
+    fn malformed_exact_history_is_rejected_during_http_deserialization() {
+        for invalid in [
+            json!([]),
+            json!([-1]),
+            json!([1.5]),
+            json!(["71"]),
+            json!([4294967296u64]),
+            Value::Null,
+        ] {
+            let mut sent = payload();
+            sent["exact_prefix"]["ids"] = invalid;
+            assert!(serde_json::from_value::<GenerateRequest>(sent).is_err());
+        }
+        let mut missing_ids = payload();
+        missing_ids["exact_prefix"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ids");
+        assert!(serde_json::from_value::<GenerateRequest>(missing_ids).is_err());
+    }
+
+    #[test]
+    fn ordinary_text_and_input_ids_keep_existing_routing() {
+        let text: GenerateRequest = serde_json::from_value(json!({"text": "hello"})).unwrap();
+        assert_eq!(text.extract_text_for_routing(), "hello");
+        assert!(serde_json::to_value(&text)
+            .unwrap()
+            .get("exact_prefix")
+            .is_none());
+        let ids: GenerateRequest =
+            serde_json::from_value(json!({"input_ids": [71, 68, 75]})).unwrap();
+        assert_eq!(ids.extract_text_for_routing(), "71 68 75");
     }
 }
 
