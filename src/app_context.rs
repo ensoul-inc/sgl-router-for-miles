@@ -335,6 +335,17 @@ impl AppContextBuilder {
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
 
+        // reqwest sets TCP_USER_TIMEOUT to 30 s on Linux by default, so the kernel aborts a
+        // forwarded request once the engine has acknowledged nothing for 30 s: a keepalive
+        // probe left unanswered while a non-streaming /generate decodes, or a request body the
+        // engine is too busy to read. The router then fails a request the engine is still
+        // running. `timeout` bounds requests instead, as in upstream sgl-router
+        // (sgl-project/sglang#45696).
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            client_builder = client_builder.tcp_user_timeout(None);
+        }
+
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
